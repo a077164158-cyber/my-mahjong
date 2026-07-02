@@ -17,24 +17,310 @@ game_state = {
     "current_turn": 0,
     "last_discard": None,     # 最後一隻被打出來的牌
     "last_discarder": None,   # 誰打出最後一隻牌的
-    "pending_action": None,   # 是否有等待玩家吃碰胡的狀態
+    "waiting_action": False,  # 是否正在等待人類玩家決定吃碰胡
     "log": ["點擊上方按鈕開始新遊戲..."],
 }
 
 def sort_taiwan_mahjong(hand):
     """
-    正宗理牌邏輯：先按系列（萬=1, 筒=2, 條=3, 字=4）分，
+    絕對完美的理牌邏輯：先按系列（萬=1, 筒=2, 條=3, 字=4）分，
     系列內部再依照數字大小 1-9 排序，字牌照東南西北中發白。
     """
     def card_key(card):
-        # 字牌順序
         honor_order = {"東": 1, "南": 2, "西": 3, "北": 4, "中": 5, "發": 6, "白": 7}
         if card in honor_order:
             return (4, honor_order[card])
+        try:
+            num = int(card[0])
+            if "萬" in card: return (1, num)
+            if "筒" in card: return (2, num)
+            if "條" in card: return (3, num)
+        except:
+            pass
+        return (5, 0)
+    return sorted(hand, key=card_key)
+
+def check_win_17(hand):
+    """
+    台灣 17 張（手牌16張+1張）胡牌判斷邏輯
+    """
+    cards = hand.copy()
+    if len(cards) != 17: return False
+    counts = {}
+    for c in cards: counts[c] = counts.get(c, 0) + 1
         
-        # 數字牌順序
-        num = int(card[0])
-        if "萬" in card: return (1, num)
+    def can_hu(cnts, pairs_needed=1):
+        if sum(cnts.values()) == 0: return True
+        for c in list(cnts.keys()):
+            if cnts[c] <= 0: continue
+            if pairs_needed > 0 and cnts[c] >= 2:
+                cnts[c] -= 2
+                if can_hu(cnts, 0): return True
+                cnts[c] += 2
+            if cnts[c] >= 3:
+                cnts[c] -= 3
+                if can_hu(cnts, pairs_needed): return True
+                cnts[c] += 3
+            if "萬" in c or "筒" in c or "條" in c:
+                num = int(c[0])
+                suit = c[1]
+                c2 = f"{num+1}{suit}"
+                c3 = f"{num+2}{suit}"
+                if cnts.get(c2, 0) > 0 and cnts.get(c3, 0) > 0:
+                    cnts[c] -= 1; cnts[c2] -= 1; cnts[c3] -= 1
+                    if can_hu(cnts, pairs_needed): return True
+                    cnts[c] += 1; cnts[c2] += 1; cnts[c3] += 1
+            break
+        return False
+    return can_hu(counts, 1)
+
+def check_eat_options(hand, card):
+    if card in HONORS: return []
+    num = int(card[0])
+    suit = card[1]
+    options = []
+    combinations = [(num-2, num-1), (num-1, num+1), (num+1, num+2)]
+    for n1, n2 in combinations:
+        c1 = f"{n1}{suit}"
+        c2 = f"{n2}{suit}"
+        if c1 in hand and c2 in hand: options.append([c1, c2])
+    return options
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>豪華擬真台灣16張麻將桌</title>
+    <style>
+        body { font-family: 'PingFang TC', 'Microsoft JhengHei', sans-serif; background: #07120a; color: white; text-align: center; margin: 0; padding: 10px; }
+        .container { max-width: 900px; margin: auto; }
+        
+        /* 綠色高級擬真防震牌桌 */
+        .mahjong-table {
+            position: relative; width: 100%; max-width: 650px; height: 650px;
+            background: radial-gradient(#1e5e31, #113b1e); border: 16px solid #3d2310; border-radius: 24px;
+            margin: 15px auto; box-shadow: 0 12px 35px rgba(0,0,0,0.9), inset 0 0 50px rgba(0,0,0,0.7);
+        }
+        
+        .table-center {
+            position: absolute; top: 26%; left: 26%; width: 48%; height: 48%;
+            background: #0d2915; border: 4px solid #07190d; border-radius: 12px;
+            padding: 12px; box-sizing: border-box; display: flex; flex-direction: column;
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
+        }
+        .discard-grid { flex: 1; padding-top: 5px; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 5px; overflow-y: auto; }
+        
+        /* 互動大按鈕專區 */
+        .action-bar { margin: 10px 0; min-height: 50px; display: flex; justify-content: center; align-items: center; gap: 12px; }
+        .act-btn { background: linear-gradient(#f1c40f, #f39c12); color: black; font-weight: bold; font-size: 16px; border: 2px solid #fff; padding: 10px 22px; border-radius: 8px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.4); display: none; }
+        .act-btn:hover { transform: scale(1.05); }
+        .btn-cancel { background: linear-gradient(#95a5a6, #7f8c8d); color: white; }
+        
+        /* 高級仿真立體麻將牌面 */
+        .mj-card {
+            display: inline-block; width: 28px; height: 38px; background: linear-gradient(#ffffff 60%, #eaeaea); color: #000; 
+            font-weight: 900; text-align: center; line-height: 36px; font-size: 15px;
+            border-radius: 5px; border-bottom: 4px solid #11692c; border-right: 1.5px solid #bbb;
+            box-shadow: 2px 3px 5px rgba(0,0,0,0.5); box-sizing: border-box; user-select: none;
+        }
+        .suit-man { color: #d63031; }
+        .suit-tong { color: #0984e3; }
+        .suit-tiao { color: #27ae60; }
+        .suit-zi { color: #e67e22; }
+        
+        /* 高級擬真仿真牌背 */
+        .mj-back { 
+            display: inline-block; background: linear-gradient(#1ba949, #11692c); 
+            border: 1.5px solid #fff; border-radius: 4px; box-shadow: 1px 2px 4px rgba(0,0,0,0.5); 
+        }
+        
+        /* 圍桌佈局設定 */
+        .player-zone { position: absolute; display: flex; justify-content: center; align-items: center; transition: all 0.3s; }
+        .zone-bottom { bottom: 15px; left: 0; width: 100%; flex-direction: column; }
+        .zone-bottom .hand-cards { display: flex; justify-content: center; width: 95%; flex-wrap: wrap; background: rgba(0,0,0,0.2); padding: 6px; border-radius: 10px; }
+        .zone-bottom .mj-card { width: 34px; height: 48px; line-height: 44px; font-size: 20px; margin: 2px; cursor: pointer; }
+        .zone-bottom .mj-card:hover { transform: translateY(-12px); background: #fffdf0; box-shadow: 0 8px 15px rgba(0,0,0,0.6); }
+        .zone-bottom .mj-card.disabled { pointer-events: none; opacity: 0.6; transform: none; background: #dcdde1; }
+        
+        .zone-top { top: 15px; left: 0; width: 100%; flex-direction: column-reverse; }
+        .zone-top .mj-back { width: 22px; height: 32px; margin: 1px; }
+        .zone-left { left: 15px; top: 0; height: 100%; flex-direction: row; }
+        .zone-left .mj-back { width: 32px; height: 22px; margin: 1px; }
+        .zone-right { right: 15px; top: 0; height: 100%; flex-direction: row-reverse; }
+        .zone-right .mj-back { width: 32px; height: 22px; margin: 1px; }
+        
+        .player-tag { background: rgba(0,0,0,0.75); padding: 5px 12px; border-radius: 15px; font-size: 13px; margin: 6px; border: 1px solid #333; }
+        .active-turn .player-tag { border: 2px solid #f1c40f; color: #f1c40f; box-shadow: 0 0 15px #f1c40f; background: rgba(0,0,0,0.9); }
+        
+        .log-box { background: rgba(0,0,0,0.7); height: 120px; overflow-y: auto; text-align: left; padding: 12px; font-size: 13px; border-radius: 8px; border: 1px solid #111; }
+        button.main-btn { padding: 12px 26px; font-size: 16px; background: linear-gradient(#e67e22, #d35400); color: white; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    </style>
+    <script>
+        let myId = null;
+        function joinGame(id) {
+            myId = id;
+            document.getElementById('join-zone').style.display = 'none';
+            document.getElementById('game-zone').style.display = 'block';
+            setInterval(updateStatus, 1000);
+        }
+        
+        function getCardClass(card) {
+            if(card.includes("萬")) return "mj-card suit-man";
+            if(card.includes("筒")) return "mj-card suit-tong";
+            if(card.includes("條")) return "mj-card suit-tiao";
+            return "mj-card suit-zi";
+        }
+
+        async function updateStatus() {
+            let res = await fetch('/state');
+            let data = await res.json();
+            
+            document.getElementById('log').innerHTML = data.log.join('<br>');
+            
+            // 渲染海底牌
+            let grid = document.getElementById('discard-grid');
+            grid.innerHTML = "";
+            data.discard_pile.forEach(card => {
+                let div = document.createElement('div');
+                div.className = getCardClass(card);
+                div.innerText = card;
+                grid.appendChild(div);
+            });
+            
+            let mapping = (myId == 0) ? {0:'bottom', 1:'right', 2:'top', 3:'left'} : {2:'bottom', 3:'right', 0:'top', 1:'left'};
+            document.getElementById('identity-title').innerText = "🀄 你的座位：" + (myId == 0 ? "下方【東家】" : "下方【西家】");
+            
+            // 渲染四個方位
+            for(let i=0; i<4; i++) {
+                let pos = mapping[i];
+                let zone = document.getElementById('zone-' + pos);
+                let tag = document.getElementById('tag-' + pos);
+                let cardsDiv = document.getElementById('cards-' + pos);
+                
+                tag.innerText = ((i == myId) ? "⭐【你自己】" : data.seats[i]) + ` (${data.hands[i].length}張)`;
+                zone.className = `player-zone zone-${pos}` + (i == data.current_turn ? " active-turn" : "");
+                
+                cardsDiv.innerHTML = "";
+                if(pos === 'bottom') {
+                    // 人類玩家：強制顯示完美排序手牌
+                    let isMyTurn = (data.current_turn == myId && !data.waiting_action);
+                    data.hands[myId].forEach((card, index) => {
+                        let btn = document.createElement('div');
+                        btn.className = getCardClass(card) + (isMyTurn ? "" : " disabled");
+                        btn.innerText = card;
+                        btn.onclick = () => discard(index);
+                        cardsDiv.appendChild(btn);
+                    });
+                } else {
+                    // 其他三家圍桌：暗牌顯示仿真牌背
+                    for(let c=0; c<data.hands[i].length; c++) {
+                        let back = document.createElement('div');
+                        back.className = "mj-back";
+                        cardsDiv.appendChild(back);
+                    }
+                }
+            }
+            
+            // 檢查是否彈出吃碰胡選單
+            checkActionButtons(data);
+        }
+        
+        function checkActionButtons(data) {
+            let btnPon = document.getElementById('btn-pon');
+            let btnChi = document.getElementById('btn-chi');
+            let btnHu = document.getElementById('btn-hu');
+            let btnCancel = document.getElementById('btn-cancel');
+            
+            btnPon.style.display = 'none';
+            btnChi.style.display = 'none';
+            btnHu.style.display = 'none';
+            btnCancel.style.display = 'none';
+            
+            // 情境 A：別家剛打牌，等待我方響應吃碰胡
+            if (data.last_discard && data.last_discarder !== myId && data.waiting_action) {
+                let myHand = data.hands[myId] || [];
+                let card = data.last_discard;
+                let showBar = false;
+                
+                // 1. 榮和胡牌檢查
+                let tempHand = [...myHand, card];
+                btnHu.style.display = 'inline-block'; btnHu.innerText = "胡牌！"; showBar = true;
+                
+                // 2. 碰牌檢查
+                if (myHand.filter(c => c === card).length >= 2) {
+                    btnPon.style.display = 'inline-block'; showBar = true;
+                }
+                
+                // 3. 吃牌檢查（上家限制）
+                let isUpper = (myId === 0 && data.last_discarder === 3) || (myId === 2 && data.last_discarder === 1);
+                if (isUpper && !["東","南","西","北","中","發","白"].includes(card)) {
+                    let num = parseInt(card[0]); let suit = card[1];
+                    if ((myHand.includes((num-1)+suit) && myHand.includes((num+1)+suit)) ||
+                        (myHand.includes((num-2)+suit) && myHand.includes((num-1)+suit)) ||
+                        (myHand.includes((num+1)+suit) && myHand.includes((num+2)+suit))) {
+                        btnChi.style.display = 'inline-block'; showBar = true;
+                    }
+                }
+                if (showBar) btnCancel.style.display = 'inline-block';
+            }
+            
+            // 情境 B：自摸檢查
+            if (data.current_turn === myId && data.hands[myId].length === 17) {
+                btnHu.style.display = 'inline-block'; btnHu.innerText = "自摸胡牌！";
+            }
+        }
+        
+        async function doAction(type) {
+            await fetch(`/action?player_id=${myId}&type=${type}`);
+            updateStatus();
+        }
+        async function discard(index) {
+            await fetch('/discard?player_id=' + myId + '&index=' + index);
+            updateStatus();
+        }
+        async function restartGame() {
+            await fetch('/restart');
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h2>🀄 台灣16張完全體：仿真豪華四人牌桌 🀄</h2>
+        <button class="main-btn" onclick="restartGame()">🃏 重新洗牌 / 新局開始</button>
+        <h3 id="identity-title" style="color: #f1c40f; margin: 5px 0;"></h3>
+        
+        <div class="action-bar">
+            <button id="btn-hu" class="act-btn" onclick="doAction('hu')">胡牌！</button>
+            <button id="btn-pon" class="act-btn" onclick="doAction('pon')">碰牌</button>
+            <button id="btn-chi" class="act-btn" onclick="doAction('chi')">吃牌</button>
+            <button id="btn-cancel" class="act-btn btn-cancel" onclick="doAction('cancel')">過 (不吃碰)</button>
+        </div>
+        
+        <div id="join-zone">
+            <button class="main-btn" style="background:#3498db; margin: 10px;" onclick="joinGame(0)">我是 玩家1 (東家)</button>
+            <button class="main-btn" style="background:#3498db; margin: 10px;" onclick="joinGame(2)">我是 玩家2 (西家)</button>
+        </div>
+        
+        <div id="game-zone" style="display:none;">
+            <div class="mahjong-table">
+                <div id="zone-top" class="player-zone zone-top"><div id="tag-top" class="player-tag"></div><div id="cards-top" class="hand-cards"></div></div>
+                <div id="zone-left" class="player-zone zone-left"><div id="tag-left" class="player-tag"></div><div id="cards-left" class="hand-cards"></div></div>
+                <div id="zone-right" class="player-zone zone-right"><div id="cards-right" class="hand-cards"></div><div id="tag-right" class="player-tag"></div></div>
+                
+                <div class="table-center">
+                    <div style="font-size:12px; color:#8ba894; font-weight:bold; letter-spacing:3px;">【海 底 牌 桌】</div>
+                    <div id="discard-grid" class="discard-grid"></div>
+                </div>
+                
+                <div id="zone-bottom" class="player-zone zone-bottom"><div id="cards-bottom" class="hand-cards"></div><div id="tag-bottom" class="player-tag"></div></div>
+            </div>
+            <h4>【對局即時日誌】</h4>
+            <div id="log" class="log-box"></div>
+        </div>
+    </div>
+</body>
+</html>        if "萬" in card: return (1, num)
         if "筒" in card: return (2, num)
         if "條" in card: return (3, num)
         return (5, 0)
