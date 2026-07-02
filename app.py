@@ -15,26 +15,486 @@ game_state = {
     "hands": {0: [], 1: [], 2: [], 3: []},
     "discard_pile": [],
     "current_turn": 0,
-    "last_discard": None,     # 最後一隻被打出來的牌
-    "last_discarder": None,   # 誰打出最後一隻牌的
-    "waiting_action": False,  # 是否正在等待人類玩家決定吃碰胡
+    "last_discard": None,     
+    "last_discarder": None,   
+    "waiting_action": False,  
     "log": ["點擊上方按鈕開始新遊戲..."],
 }
 
 def sort_taiwan_mahjong(hand):
     """
-    絕對完美的理牌邏輯：先按系列（萬=1, 筒=2, 條=3, 字=4）分，
-    系列內部再依照數字大小 1-9 排序，字牌照東南西北中發白。
+    絕對完美的理牌：萬->筒->條->字，且各自內部嚴格按照 1 到 9 數字排序。
     """
+    honor_order = {"東": 1, "南": 2, "西": 3, "北": 4, "中": 5, "發": 6, "白": 7}
+    
     def card_key(card):
-        honor_order = {"東": 1, "南": 2, "西": 3, "北": 4, "中": 5, "發": 6, "白": 7}
         if card in honor_order:
             return (4, honor_order[card])
-        try:
-            num = int(card[0])
-            if "萬" in card: return (1, num)
-            if "筒" in card: return (2, num)
-            if "條" in card: return (3, num)
+        if len(card) >= 2:
+            try:
+                num = int(card[0])
+                if "萬" in card: return (1, num)
+                if "筒" in card: return (2, num)
+                if "條" in card: return (3, num)
+            except:
+                pass
+        return (5, 0)
+        
+    return sorted(hand, key=card_key)
+
+def check_win_17(hand):
+    cards = hand.copy()
+    if len(cards) != 17: return False
+    counts = {}
+    for c in cards: counts[c] = counts.get(c, 0) + 1
+        
+    def can_hu(cnts, pairs_needed=1):
+        if sum(cnts.values()) == 0: return True
+        for c in list(cnts.keys()):
+            if cnts[c] <= 0: continue
+            if pairs_needed > 0 and cnts[c] >= 2:
+                cnts[c] -= 2
+                if can_hu(cnts, 0): return True
+                cnts[c] += 2
+            if cnts[c] >= 3:
+                cnts[c] -= 3
+                if can_hu(cnts, pairs_needed): return True
+                cnts[c] += 3
+            if "萬" in c or "筒" in c or "條" in c:
+                num = int(c[0])
+                suit = c[1]
+                c2 = f"{num+1}{suit}"
+                c3 = f"{num+2}{suit}"
+                if cnts.get(c2, 0) > 0 and cnts.get(c3, 0) > 0:
+                    cnts[c] -= 1; cnts[c2] -= 1; cnts[c3] -= 1
+                    if can_hu(cnts, pairs_needed): return True
+                    cnts[c] += 1; cnts[c2] += 1; cnts[c3] += 1
+            break
+        return False
+    return can_hu(counts, 1)
+
+def check_eat_options(hand, card):
+    if card in HONORS: return []
+    num = int(card[0])
+    suit = card[1]
+    options = []
+    combinations = [(num-2, num-1), (num-1, num+1), (num+1, num+2)]
+    for n1, n2 in combinations:
+        c1 = f"{n1}{suit}"
+        c2 = f"{n2}{suit}"
+        if c1 in hand and c2 in hand: options.append([c1, c2])
+    return options
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>台灣16張正宗麻將桌</title>
+    <style>
+        body { font-family: 'PingFang TC', 'Microsoft JhengHei', sans-serif; background: #0c2415; color: white; text-align: center; margin: 0; padding: 10px; }
+        .container { max-width: 800px; margin: auto; }
+        
+        /* 四人方桌佈局結構 */
+        .mahjong-table {
+            position: relative; width: 100%; max-width: 600px; height: 550px;
+            background: #1b522c; border: 12px solid #3a1e05; border-radius: 16px;
+            margin: 15px auto; box-shadow: 0 8px 25px rgba(0,0,0,0.7);
+        }
+        
+        /* 四個方位座位 */
+        .player-zone { position: absolute; background: rgba(0,0,0,0.6); padding: 6px; border-radius: 8px; border: 1px solid #333; box-sizing: border-box; }
+        .zone-top { top: 10px; left: 50%; transform: translateX(-50%); width: 70%; }
+        .zone-bottom { bottom: 10px; left: 50%; transform: translateX(-50%); width: 90%; background: rgba(0,0,0,0.8); border: 2px solid #555; }
+        .zone-left { left: 10px; top: 40%; transform: translateY(-50%); width: 100px; }
+        .zone-right { right: 10px; top: 40%; transform: translateY(-50%); width: 100px; }
+        
+        /* 輪到該回合的外框發光效果 */
+        .active-turn { border: 2px solid #f1c40f !important; box-shadow: 0 0 15px #f1c40f; }
+        
+        /* 中央海底丟牌區 */
+        .table-center {
+            position: absolute; top: 25%; left: 25%; width: 50%; height: 40%;
+            background: #0f361d; border: 2px solid #0a2212; border-radius: 8px;
+            padding: 8px; box-sizing: border-box; display: flex; flex-direction: column;
+        }
+        .discard-grid { flex: 1; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 4px; overflow-y: auto; }
+        
+        /* 按鈕特區 */
+        .action-bar { margin: 10px 0; min-height: 45px; display: flex; justify-content: center; gap: 10px; }
+        .act-btn { background: #f1c40f; color: black; font-weight: bold; font-size: 15px; border: 2px solid #fff; padding: 8px 18px; border-radius: 6px; cursor: pointer; display: none; }
+        .btn-cancel { background: #95a5a6; color: white; }
+        
+        /* 麻將外觀造型 */
+        .mj-card {
+            display: inline-block; width: 28px; height: 38px; background: #ffffff; color: #000; 
+            font-weight: bold; text-align: center; line-height: 36px; font-size: 15px;
+            border-radius: 4px; border-bottom: 3px solid #148037; border-right: 1px solid #ccc;
+            box-shadow: 1px 2px 3px rgba(0,0,0,0.4); margin: 2px; box-sizing: border-box; vertical-align: middle;
+        }
+        .suit-man { color: #c0392b; }
+        .suit-tong { color: #2980b9; }
+        .suit-tiao { color: #27ae60; }
+        .suit-zi { color: #d35400; }
+        
+        /* 仿真手牌放大版 */
+        .zone-bottom .mj-card {
+            width: 34px; height: 46px; line-height: 44px; font-size: 18px; cursor: pointer;
+        }
+        .zone-bottom .mj-card:hover { transform: translateY(-6px); background: #fffde6; }
+        .zone-bottom .mj-card.disabled { pointer-events: none; opacity: 0.5; background: #e0e0e0; transform: none; }
+        
+        /* 蓋著的牌（牌背） */
+        .mj-back { display: inline-block; width: 16px; height: 24px; background: #1b7a37; border: 1px solid #fff; border-radius: 2px; margin: 1px; }
+        
+        .player-tag { font-size: 12px; color: #f1c40f; font-weight: bold; margin-bottom: 4px; }
+        .log-box { background: rgba(0,0,0,0.7); height: 100px; overflow-y: auto; text-align: left; padding: 10px; font-size: 13px; border-radius: 6px; border: 1px solid #222; }
+        button.main-btn { padding: 10px 20px; font-size: 15px; background: #e67e22; color: white; font-weight: bold; border: none; border-radius: 4px; cursor: pointer; }
+    </style>
+    <script>
+        let myId = null;
+        function joinGame(id) {
+            myId = id;
+            document.getElementById('join-zone').style.display = 'none';
+            document.getElementById('game-zone').style.display = 'block';
+            setInterval(updateStatus, 1000);
+        }
+        
+        function getCardClass(card) {
+            if(card.includes("萬")) return "mj-card suit-man";
+            if(card.includes("筒")) return "mj-card suit-tong";
+            if(card.includes("條")) return "mj-card suit-tiao";
+            return "mj-card suit-zi";
+        }
+
+        async function updateStatus() {
+            let res = await fetch('/state');
+            let data = await res.json();
+            
+            document.getElementById('log').innerHTML = data.log.join('<br>');
+            
+            // 渲染中央海底
+            let grid = document.getElementById('discard-grid');
+            grid.innerHTML = "";
+            data.discard_pile.forEach(card => {
+                let div = document.createElement('div');
+                div.className = getCardClass(card);
+                div.innerText = card;
+                grid.appendChild(div);
+            });
+            
+            let mapping = (myId == 0) ? {0:'bottom', 1:'right', 2:'top', 3:'left'} : {2:'bottom', 3:'right', 0:'top', 1:'left'};
+            document.getElementById('identity-title').innerText = "🀄 你的座位：" + (myId == 0 ? "下方【東家】" : "下方【西家】");
+            
+            // 更新四個方位
+            for(let i=0; i<4; i++) {
+                let pos = mapping[i];
+                let zone = document.getElementById('zone-' + pos);
+                let tag = document.getElementById('tag-' + pos);
+                let cardsDiv = document.getElementById('cards-' + pos);
+                
+                tag.innerText = ((i == myId) ? "⭐ 我自己" : data.seats[i]) + ` [${data.hands[i].length}張]`;
+                
+                if(i == data.current_turn) {
+                    zone.className = `player-zone zone-${pos} active-turn`;
+                } else {
+                    zone.className = `player-zone zone-${pos}`;
+                }
+                
+                cardsDiv.innerHTML = "";
+                if(pos === 'bottom') {
+                    // 人類手牌顯示（後端傳過來已經嚴格按照數字排序）
+                    let isMyTurn = (data.current_turn == myId && !data.waiting_action);
+                    data.hands[myId].forEach((card, index) => {
+                        let btn = document.createElement('div');
+                        btn.className = getCardClass(card) + (isMyTurn ? "" : " disabled");
+                        btn.innerText = card;
+                        btn.onclick = () => discard(card); // 傳遞「卡牌名稱」給後端刪除，徹底杜絕索引錯亂！
+                        cardsDiv.appendChild(btn);
+                    });
+                } else {
+                    // 其他人顯示牌背
+                    let count = data.hands[i].length;
+                    for(let c=0; c<count; c++) {
+                        let back = document.createElement('div');
+                        back.className = "mj-back";
+                        cardsDiv.appendChild(back);
+                    }
+                }
+            }
+            
+            // 按鈕控制
+            checkActionButtons(data);
+        }
+        
+        function checkActionButtons(data) {
+            let btnPon = document.getElementById('btn-pon');
+            let btnChi = document.getElementById('btn-chi');
+            let btnHu = document.getElementById('btn-hu');
+            let btnCancel = document.getElementById('btn-cancel');
+            
+            btnPon.style.display = 'none';
+            btnChi.style.display = 'none';
+            btnHu.style.display = 'none';
+            btnCancel.style.display = 'none';
+            
+            if (data.last_discard && data.last_discarder !== myId && data.waiting_action) {
+                let myHand = data.hands[myId] || [];
+                let card = data.last_discard;
+                let showBar = false;
+                
+                if (check_win_17_frontend(myHand, card)) {
+                    btnHu.style.display = 'inline-block'; btnHu.innerText = "胡牌！"; showBar = true;
+                }
+                if (myHand.filter(c => c === card).length >= 2) {
+                    btnPon.style.display = 'inline-block'; showBar = true;
+                }
+                let isUpper = (myId === 0 && data.last_discarder === 3) || (myId === 2 && data.last_discarder === 1);
+                if (isUpper && !["東","南","西","北","中","發","白"].includes(card)) {
+                    let num = parseInt(card[0]); let suit = card[1];
+                    if ((myHand.includes((num-1)+suit) && myHand.includes((num+1)+suit)) ||
+                        (myHand.includes((num-2)+suit) && myHand.includes((num-1)+suit)) ||
+                        (myHand.includes((num+1)+suit) && myHand.includes((num+2)+suit))) {
+                        btnChi.style.display = 'inline-block'; showBar = true;
+                    }
+                }
+                if (showBar) btnCancel.style.display = 'inline-block';
+            }
+            
+            if (data.current_turn === myId && data.hands[myId].length === 17) {
+                btnHu.style.display = 'inline-block'; btnHu.innerText = "自摸胡牌！";
+            }
+        }
+        
+        function check_win_17_frontend(hand, card) {
+            // 前端概略提示，點擊胡牌後由後端做精確審查
+            return true; 
+        }
+        
+        async function doAction(type) {
+            await fetch(`/action?player_id=${myId}&type=${type}`);
+            updateStatus();
+        }
+        async function discard(cardName) {
+            await fetch('/discard?player_id=' + myId + '&card=' + encodeURIComponent(cardName));
+            updateStatus();
+        }
+        async function restartGame() {
+            await fetch('/restart');
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h2>🀄 台灣16張：正宗完美理牌四人方桌 🀄</h2>
+        <button class="main-btn" onclick="restartGame()">🃏 重新洗牌 / 開始新局</button>
+        <h3 id="identity-title" style="color: #f1c40f; margin: 5px 0;"></h3>
+        
+        <div class="action-bar">
+            <button id="btn-hu" class="act-btn" onclick="doAction('hu')">胡牌！</button>
+            <button id="btn-pon" class="act-btn" onclick="doAction('pon')">碰牌</button>
+            <button id="btn-chi" class="act-btn" onclick="doAction('chi')">吃牌</button>
+            <button id="btn-cancel" class="act-btn btn-cancel" onclick="doAction('cancel')">過 (不吃碰)</button>
+        </div>
+        
+        <div id="join-zone">
+            <button class="main-btn" style="background:#3498db; margin: 10px;" onclick="joinGame(0)">我是 玩家1 (東家)</button>
+            <button class="main-btn" style="background:#3498db; margin: 10px;" onclick="joinGame(2)">我是 玩家2 (西家)</button>
+        </div>
+        
+        <div id="game-zone" style="display:none;">
+            <div class="mahjong-table">
+                <div id="zone-top" class="player-zone zone-top"><div id="tag-top" class="player-tag"></div><div id="cards-top"></div></div>
+                <div id="zone-left" class="player-zone zone-left"><div id="tag-left" class="player-tag"></div><div id="cards-left"></div></div>
+                <div id="zone-right" class="player-zone zone-right"><div id="tag-right" class="player-tag"></div><div id="cards-right"></div></div>
+                
+                <div class="table-center">
+                    <div style="font-size:11px; color:#a2cfb0; font-weight:bold; margin-bottom:3px;">【 海 底 丟 牌 】</div>
+                    <div id="discard-grid" class="discard-grid"></div>
+                </div>
+                
+                <div id="zone-bottom" class="player-zone zone-bottom"><div id="tag-bottom" class="player-tag"></div><div id="cards-bottom"></div></div>
+            </div>
+            <h4>【 對局日誌 】</h4>
+            <div id="log" class="log-box"></div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+def check_bot_intercept(card, discarder_id):
+    """ 檢查機器人是否要吃碰胡 """
+    for i in [1, 3]:  
+        if i == discarder_id: continue
+        bot_hand = game_state["hands"][i]
+        
+        if check_win_17(bot_hand + [card]):
+            game_state["hands"][i].append(card)
+            game_state["hands"][i] = sort_taiwan_mahjong(game_state["hands"][i])
+            game_state["log"].append(f"🤖 {game_state['seats'][i]} 喊了 【胡牌！】並大倒牌！")
+            game_state["current_turn"] = -1
+            return True
+            
+        if bot_hand.count(card) >= 2 and random.random() < 0.4:
+            game_state["discard_pile"].pop()
+            game_state["hands"][i].remove(card)
+            game_state["hands"][i].remove(card)
+            game_state["hands"][i] += [card, card, card]
+            game_state["hands"][i] = sort_taiwan_mahjong(game_state["hands"][i])
+            game_state["log"].append(f"🤖 {game_state['seats'][i]} 喊了 【碰！】拿走 【{card}】")
+            game_state["current_turn"] = i
+            game_state["last_discard"] = None
+            bot_action() 
+            return True
+    return False
+
+def bot_action():
+    while game_state["current_turn"] in [1, 3] and len(game_state["deck"]) > 0:
+        turn = game_state["current_turn"]
+        
+        drawn = game_state["deck"].pop()
+        game_state["hands"][turn].append(drawn)
+        game_state["hands"][turn] = sort_taiwan_mahjong(game_state["hands"][turn])
+        
+        if check_win_17(game_state["hands"][turn]):
+            game_state["log"].append(f"🎉 🤖 {game_state['seats'][turn]} 自摸胡牌了！")
+            game_state["current_turn"] = -1
+            return
+            
+        bot_honors = [c for c in game_state["hands"][turn] if c in HONORS]
+        discarded = bot_honors[0] if bot_honors else random.choice(game_state["hands"][turn])
+        
+        game_state["hands"][turn].remove(discarded)
+        game_state["discard_pile"].append(discarded)
+        game_state["last_discard"] = discarded
+        game_state["last_discarder"] = turn
+        game_state["log"].append(f"❌ {game_state['seats'][turn]} 打出了 【{discarded}】")
+        
+        if check_bot_intercept(discarded, turn):
+            return
+            
+        game_state["current_turn"] = (game_state["current_turn"] + 1) % 4
+        if game_state["current_turn"] in [0, 2]:
+            game_state["waiting_action"] = True
+            game_state["log"].append(f"⚡ 等待玩家回應是否對 【{discarded}】 進行吃碰胡...")
+            return
+
+@app.route('/')
+def index(): return render_template_string(HTML_TEMPLATE)
+
+@app.route('/state')
+def get_state(): return jsonify(game_state)
+
+@app.route('/discard')
+def discard():
+    p_id = int(request.args.get('player_id'))
+    card_name = request.args.get('card') # 改由卡牌名稱直接刪除，防錯萬無一失
+    
+    if game_state["current_turn"] == p_id and not game_state["waiting_action"]:
+        if card_name in game_state["hands"][p_id]:
+            game_state["hands"][p_id].remove(card_name)
+            game_state["discard_pile"].append(card_name)
+            game_state["last_discard"] = card_name
+            game_state["last_discarder"] = p_id
+            game_state["hands"][p_id] = sort_taiwan_mahjong(game_state["hands"][p_id])
+            game_state["log"].append(f"❌ {game_state['seats'][p_id]} 打出了 【{card_name}】")
+            
+            if check_bot_intercept(card_name, p_id):
+                return jsonify({"status": "success"})
+                
+            game_state["current_turn"] = (game_state["current_turn"] + 1) % 4
+            
+            if game_state["current_turn"] in [0, 2]:
+                draw_card_for_player(game_state["current_turn"])
+            else:
+                bot_action()
+                
+    return jsonify({"status": "success"})
+
+def draw_card_for_player(p_id):
+    if len(game_state["deck"]) > 0:
+        drawn = game_state["deck"].pop()
+        game_state["hands"][p_id].append(drawn)
+        game_state["hands"][p_id] = sort_taiwan_mahjong(game_state["hands"][p_id])
+        game_state["log"].append(f"👉 {game_state['seats'][p_id]} 摸牌（第 17 張）")
+    else:
+        game_state["log"].append("🀄 牌海已空，本局流局！")
+        game_state["current_turn"] = -1
+
+@app.route('/action')
+def do_action():
+    p_id = int(request.args.get('player_id'))
+    act_type = request.args.get('type')
+    card = game_state["last_discard"]
+    
+    if act_type == 'cancel':
+        game_state["waiting_action"] = False
+        game_state["log"].append(f"👌 玩家選擇 【過】。")
+        if game_state["current_turn"] in [0, 2]:
+            draw_card_for_player(game_state["current_turn"])
+        else:
+            bot_action()
+        return jsonify({"status": "success"})
+
+    if act_type == 'hu':
+        full_hand = game_state["hands"][p_id] if game_state["current_turn"] == p_id else game_state["hands"][p_id] + [card]
+        if check_win_17(full_hand):
+            game_state["hands"][p_id] = sort_taiwan_mahjong(full_hand)
+            game_state["log"].append(f"🎉 恭喜 {game_state['seats'][p_id]} 胡牌贏了！！！")
+            game_state["current_turn"] = -1
+        return jsonify({"status": "success"})
+
+    game_state["waiting_action"] = False
+    
+    if act_type == 'pon':
+        game_state["discard_pile"].pop()
+        game_state["hands"][p_id].remove(card)
+        game_state["hands"][p_id].remove(card)
+        game_state["hands"][p_id] += [card, card, card]
+        game_state["hands"][p_id] = sort_taiwan_mahjong(game_state["hands"][p_id])
+        game_state["log"].append(f"📣 {game_state['seats'][p_id]} 喊了 【碰！】")
+        game_state["current_turn"] = p_id 
+        game_state["last_discard"] = None
+            
+    elif act_type == 'chi':
+        options = check_eat_options(game_state["hands"][p_id], card)
+        if options:
+            chosen = options[0]
+            game_state["discard_pile"].pop()
+            game_state["hands"][p_id].remove(chosen[0])
+            game_state["hands"][p_id].remove(chosen[1])
+            game_state["hands"][p_id] += [chosen[0], chosen[1], card]
+            game_state["hands"][p_id] = sort_taiwan_mahjong(game_state["hands"][p_id])
+            game_state["log"].append(f"🍕 {game_state['seats'][p_id]} 喊了 【吃！】")
+            game_state["current_turn"] = p_id 
+            game_state["last_discard"] = None
+
+    return jsonify({"status": "success"})
+
+@app.route('/restart')
+def restart():
+    game_state["deck"] = FULL_DECK.copy()
+    random.shuffle(game_state["deck"])
+    game_state["discard_pile"] = []
+    game_state["last_discard"] = None
+    game_state["waiting_action"] = False
+    game_state["log"] = ["台灣16張新局開始！手牌已強制執行萬、筒、條、字與數字完美理牌。"]
+    game_state["current_turn"] = 0
+    
+    for i in range(4):
+        initial_hand = [game_state["deck"].pop() for _ in range(16)]
+        game_state["hands"][i] = sort_taiwan_mahjong(initial_hand)
+        
+    drawn = game_state["deck"].pop()
+    game_state["hands"][0].append(drawn)
+    game_state["hands"][0] = sort_taiwan_mahjong(game_state["hands"][0])
+    game_state["log"].append("👉 玩家1(東) 摸了第 17 張開局牌。")
+    return jsonify({"status": "success"})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)            if "條" in card: return (3, num)
         except:
             pass
         return (5, 0)
