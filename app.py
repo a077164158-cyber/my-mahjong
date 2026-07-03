@@ -1,67 +1,165 @@
-import os
-import random
-from flask import Flask, render_template_string, jsonify, request
+  <script>
+    let state = null;
+    let mySeat = Number(localStorage.getItem("mahjongSeat") || "0");
+    if (![0, 2].includes(mySeat)) mySeat = 0;
 
-app = Flask(__name__)
+    async function post(url, body = {}) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      state = await response.json();
+      render();
+    }
 
-# 初始化 136 張麻將牌
-SUITS = [f"{i}萬" for i in range(1, 10)] + [f"{i}筒" for i in range(1, 10)] + [f"{i}條" for i in range(1, 10)]
-HONORS = ["東", "南", "西", "北", "中", "發", "白"]
-FULL_DECK = (SUITS + HONORS) * 4
+    async function loadState() {
+      const response = await fetch("/api/state");
+      state = await response.json();
+      render();
+    }
 
-game_state = {
-    "deck": [],
-    "seats": ["玩家1(東)", "機器人1(南)", "玩家2(西)", "機器人2(北)"],
-    "hands": {0: [], 1: [], 2: [], 3: []},
-    "discard_pile": [],
-    "current_turn": 0,
-    "last_discard": None,     
-    "last_discarder": None,   
-    "waiting_action": False,  
-    "log": ["點擊上方按鈕開始新遊戲..."],
-}
+    function newGame() { post("/api/new"); }
+    function draw() { post("/api/draw"); }
+    function passAction() { post("/api/action", { action: "pass" }); }
+    function chooseSeat(seat) {
+      mySeat = seat;
+      localStorage.setItem("mahjongSeat", String(seat));
+      render();
+    }
 
-def sort_taiwan_mahjong(hand):
-    """
-    絕對完美的理牌：萬->筒->條->字，且各自內部嚴格按照 1 到 9 數字排序。
-    """
-    honor_order = {"東": 1, "南": 2, "西": 3, "北": 4, "中": 5, "發": 6, "白": 7}
-    
-    def card_key(card):
-        if card in honor_order:
-            return (4, honor_order[card])
-        if len(card) >= 2:
-            try:
-                num = int(card[0])
-                if "萬" in card: return (1, num)
-                if "筒" in card: return (2, num)
-                if "條" in card: return (3, num)
-            except:
-                pass
-        return (5, 0)
-        
-    return sorted(hand, key=card_key)
+    function discard(player, tile) {
+      if (!state || state.winner !== null) return;
+      post("/api/discard", { player, tile });
+    }
 
-def check_win_17(hand):
-    cards = hand.copy()
-    if len(cards) != 17: return False
-    counts = {}
-    for c in cards: counts[c] = counts.get(c, 0) + 1
-        
-    def can_hu(cnts, pairs_needed=1):
-        if sum(cnts.values()) == 0: return True
-        for c in list(cnts.keys()):
-            if cnts[c] <= 0: continue
-            if pairs_needed > 0 and cnts[c] >= 2:
-                cnts[c] -= 2
-                if can_hu(cnts, 0): return True
-                cnts[c] += 2
-            if cnts[c] >= 3:
-                cnts[c] -= 3
-                if can_hu(cnts, pairs_needed): return True
-                cnts[c] += 3
-            if "萬" in c or "筒" in c or "條" in c:
-                num = int(c[0])
+    function action(item) {
+      post("/api/action", item);
+    }
+
+    function tileHtml(tile, playable, player) {
+      const click = playable ? `onclick="discard(${player}, '${tile}')"` : "";
+      const klass = playable ? "tile playable" : "tile";
+      return `<button class="${klass}" title="${tile}" ${click}>${tileFace(tile)}</button>`;
+    }
+
+    function fixedPositions(count) {
+      const maps = {
+        1: [4],
+        2: [0, 8],
+        3: [0, 4, 8],
+        4: [0, 2, 6, 8],
+        5: [0, 2, 4, 6, 8],
+        6: [0, 2, 3, 5, 6, 8],
+        7: [0, 2, 3, 4, 5, 6, 8],
+        8: [0, 1, 2, 3, 5, 6, 7, 8],
+        9: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+      };
+      return maps[count] || [];
+    }
+
+    function tileFace(tile) {
+      if (tile.length === 2 && "萬筒條".includes(tile[1])) {
+        const number = Number(tile[0]);
+        const suit = tile[1];
+        if (suit === "筒") {
+          const pips = fixedPositions(number);
+          return `<span class="tile-face"><span class="pips">${
+            Array.from({ length: 9 }, (_, i) => {
+              const color = i % 3 === 0 ? "red" : i % 3 === 1 ? "blue" : "green";
+              return pips.includes(i) ? `<span class="pip ${color}"></span>` : "<span></span>";
+            }).join("")
+          }</span></span><span class="tile-num">${number}筒</span>`;
+        }
+        if (suit === "條") {
+          const bams = fixedPositions(number);
+          return `<span class="tile-face"><span class="bams">${
+            Array.from({ length: 9 }, (_, i) => bams.includes(i) ? '<span class="bam"></span>' : "<span></span>").join("")
+          }</span></span><span class="tile-num">${number}條</span>`;
+        }
+        return `<span class="tile-face chars"><span>${number}</span><span class="wan-mark">萬</span></span>`;
+      }
+
+      const dragonClass = tile === "中" ? "dragon-red" : tile === "發" ? "dragon-green" : tile === "白" ? "dragon-white" : "wind";
+      return `<span class="tile-face"><span class="honor ${dragonClass}">${tile}</span></span>`;
+    }
+
+    function tileBacks(count) {
+      return Array.from({ length: count }, () => '<span class="tile back">牌</span>').join("");
+    }
+
+    function renderSeat(player) {
+      const el = document.getElementById(`seat-${player}`);
+      const isTurn = state.current_turn === player && !state.waiting_action && state.winner === null;
+      const hand = state.hands[String(player)] || [];
+      const melds = state.melds[String(player)] || [];
+      const isMe = mySeat === player;
+      const canDiscard = isMe && isTurn && hand.length % 3 === 2;
+
+      el.classList.toggle("me", isMe);
+      el.innerHTML = `
+        <div class="seat-title">
+          <span class="seat-name">${state.seats[player]}</span>
+          ${isTurn ? '<span class="turn">出牌</span>' : ''}
+        </div>
+        ${isMe ? "" : '<div class="private-note">對手手牌已隱藏</div>'}
+        <div class="melds">
+          ${melds.map(group => `<span class="meld">${group.map(t => `<span class="tile" title="${t}">${tileFace(t)}</span>`).join("")}</span>`).join("")}
+        </div>
+        <div class="tiles">
+          ${isMe ? hand.map(tile => tileHtml(tile, canDiscard, player)).join("") : tileBacks(hand.length)}
+        </div>
+      `;
+    }
+
+    function renderActions() {
+      const el = document.getElementById("actions");
+      const buttons = [];
+      if (state.waiting_action) {
+        for (const item of state.actions.filter(action => action.player === mySeat)) {
+          const payload = JSON.stringify(item).replaceAll('"', '&quot;');
+          const klass = item.action === "hu" ? "danger" : "";
+          buttons.push(`<button class="${klass}" onclick="action(${payload})">${item.label}</button>`);
+        }
+        if (buttons.length > 0) {
+          buttons.push('<button class="secondary" onclick="passAction()">過</button>');
+        } else {
+          buttons.push('<button class="secondary" disabled>等待其他玩家</button>');
+        }
+      }
+      el.innerHTML = buttons.join("");
+    }
+
+    function render() {
+      if (!state) return;
+      for (let player = 0; player < 4; player++) renderSeat(player);
+      renderActions();
+      document.querySelectorAll(".seat-choice").forEach(button => {
+        button.classList.toggle("active", Number(button.dataset.seat) === mySeat);
+      });
+      document.getElementById("draw-button").disabled =
+        state.current_turn !== mySeat || state.waiting_action || state.winner !== null;
+
+      document.getElementById("deck-count").textContent = `牌牆：${state.deck_count} 張`;
+      document.getElementById("last-discard").textContent = state.last_discard ? `上張：${state.last_discard}` : "";
+      document.getElementById("winner").textContent = state.winner === null ? "" : `${state.seats[state.winner]} 胡牌`;
+      document.getElementById("winner").className = "winner";
+      document.getElementById("discard").innerHTML = state.discard_pile
+        .map(item => `<span class="tile" title="${state.seats[item.player]}：${item.tile}">${tileFace(item.tile)}</span>`)
+        .join("");
+      document.getElementById("log").innerHTML = state.log.map(line => `<li>${line}</li>`).join("");
+    }
+
+    loadState();
+    setInterval(loadState, 1800);
+  </script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
                 suit = c[1]
                 c2 = f"{num+1}{suit}"
                 c3 = f"{num+2}{suit}"
